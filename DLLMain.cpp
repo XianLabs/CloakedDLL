@@ -1,135 +1,150 @@
 #include <Windows.h>
 #include <Winternl.h>
-#include <Psapi.h> //process watching
 #include <stdio.h>
 
-inline PPEB GetPEB() 
-{ 
-	return (PPEB)__readgsqword(0x60); 
-}
+typedef struct _UNICODE_STRING {
+	USHORT Length;
+	USHORT MaximumLength;
+	PWCH   Buffer;
+} UNICODE_STRING;
+typedef UNICODE_STRING *PUNICODE_STRING;
 
-VOID CheckSumBaseCloak();
-
-typedef struct _MYPEB {
-	UCHAR InheritedAddressSpace;
-	UCHAR ReadImageFileExecOptions;
-	UCHAR BeingDebugged;
-	UCHAR Spare;
-	PVOID Mutant;
-	PVOID ImageBaseAddress;
-	PEB_LDR_DATA *Ldr;
-	PRTL_USER_PROCESS_PARAMETERS ProcessParameters;
-	PVOID SubSystemData;
-	PVOID ProcessHeap;
-	PVOID FastPebLock;
-	PVOID FastPebLockRoutine;
-	PVOID FastPebUnlockRoutine;
-	ULONG EnvironmentUpdateCount;
-	PVOID* KernelCallbackTable;
-	PVOID EventLogSection;
-	PVOID EventLog;
-	PVOID FreeList;
-	ULONG TlsExpansionCounter;
-	PVOID TlsBitmap;
-	ULONG TlsBitmapBits[0x2];
-	PVOID ReadOnlySharedMemoryBase;
-	PVOID ReadOnlySharedMemoryHeap;
-	PVOID* ReadOnlyStaticServerData;
-	PVOID AnsiCodePageData;
-	PVOID OemCodePageData;
-	PVOID UnicodeCaseTableData;
-	ULONG NumberOfProcessors;
-	ULONG NtGlobalFlag;
-	UCHAR Spare2[0x4];
-	ULARGE_INTEGER CriticalSectionTimeout;
-	ULONG HeapSegmentReserve;
-	ULONG HeapSegmentCommit;
-	ULONG HeapDeCommitTotalFreeThreshold;
-	ULONG HeapDeCommitFreeBlockThreshold;
-	ULONG NumberOfHeaps;
-	ULONG MaximumNumberOfHeaps;
-	PVOID** ProcessHeaps;
-	PVOID GdiSharedHandleTable;
-	PVOID ProcessStarterHelper; //PPS_POST_PREOCESS_INIT_ROUTINE?
-	PVOID GdiDCAttributeList;
-	PVOID LoaderLock;
-	ULONG OSMajorVersion;
-	ULONG OSMinorVersion;
-	ULONG OSBuildNumber;
-	ULONG OSPlatformId;
-	ULONG ImageSubSystem;
-	ULONG ImageSubSystemMajorVersion;
-	ULONG ImageSubSystemMinorVersion;
-	ULONG GdiHandleBuffer[0x22];
-	PVOID ProcessWindowStation;
-} MYPEB, *PMYPEB;
-
-
-void NTAPI tls_callback(PVOID DllHandle, DWORD dwReason, PVOID Reserved)
+typedef struct _PEB_LDR_DATA
 {
-	if (dwReason == DLL_THREAD_ATTACH)
-	{
-		CheckSumBaseCloak();
-		printf("TLS_CALLBACK: New Thread spawned by process\n");
-	}
-	else if (dwReason == DLL_PROCESS_ATTACH)
-	{
-		CheckSumBaseCloak();
-		printf("TLS_CALLBACK: Process attached!\n");
-	}
-}
+	ULONG           Length;
+	BOOLEAN         Initialized;
+	PVOID           SsHandle;
+	LIST_ENTRY      InLoadOrderModuleList;
+	LIST_ENTRY      InMemoryOrderModuleList;
+	LIST_ENTRY      InInitializationOrderModuleList;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
 
-#pragma comment (linker, "/INCLUDE:_tls_used") 
-#pragma comment (linker, "/INCLUDE:tls_callback_func")
-#pragma const_seg(".CRT$XLF") //set segment
-EXTERN_C const PIMAGE_TLS_CALLBACK tls_callback_func = tls_callback;
-#pragma const_seg() //set segment back to .rdata
-
-VOID CheckSumBaseCloak()
+typedef struct _LDR_MODULE
 {
-	PPEB PEB = GetPEB();
-	_LIST_ENTRY* f = PEB->Ldr->InMemoryOrderModuleList.Flink;
-	UINT64 ProcessBase = (UINT64)GetModuleHandle(NULL);
-	bool Found = FALSE;
+	LIST_ENTRY      InLoadOrderModuleList;
+	LIST_ENTRY      InMemoryOrderModuleList;
+	LIST_ENTRY      InInitializationOrderModuleList;
+	PVOID           BaseAddress;
+	PVOID           EntryPoint;
+	ULONG           SizeOfImage;
+	UNICODE_STRING  FullDllName;
+	UNICODE_STRING  BaseDllName;
+	ULONG           Flags;
+	SHORT           LoadCount;
+	SHORT           TlsIndex;
+	LIST_ENTRY      HashTableEntry;
+	ULONG           TimeDateStamp;
+} LDR_MODULE, *PLDR_MODULE;
 
-	PLDR_DATA_TABLE_ENTRY CacheEntry;
+void RemovePeHeader(HANDLE GetModuleBase);
+void UnlinkModule(char *szModule);
 
-	while (!Found)
-	{	
-		PLDR_DATA_TABLE_ENTRY dataEntry = CONTAINING_RECORD(f, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-		
-		if (wcsstr(dataEntry->FullDllName.Buffer, L"CloakDLLExample.dll") != NULL)
+void UnlinkModule(char *szModule)
+{
+	DWORD dwPEB = 0, dwOffset = 0;
+	PLIST_ENTRY pUserModuleHead, pUserModule;
+	PPEB_LDR_DATA pLdrData;
+	PLDR_MODULE pLdrModule = NULL;
+	PUNICODE_STRING lpModule = NULL;
+	char szModuleName[512];
+	int i = 0, n = 0;
+
+	BYTE* _teb = (BYTE*)__readgsqword(0x30);
+	pLdrData = (PPEB_LDR_DATA)(PULONGLONG)(*(PULONGLONG)((*(PULONGLONG)(_teb + 0x60)) + 0x18));
+
+
+	for (; i < 3; i++)
+	{
+		switch (i)
 		{
-			dataEntry->CheckSum = 0x123456; //seems to successfully cloak from non-admin mode protections, more methods to come soon
-			dataEntry->DllBase = 0x0;
-			wprintf(L"%s, %llX\n", dataEntry->FullDllName.Buffer, (UINT64)dataEntry->DllBase);
-			Found = TRUE;		
-			return;
+		case 0:
+			pUserModuleHead = pUserModule = (PLIST_ENTRY)(&(pLdrData->InLoadOrderModuleList));
+			dwOffset = 0;
+			break;
+
+		case 1:
+			pUserModuleHead = pUserModule = (PLIST_ENTRY)(&(pLdrData->InMemoryOrderModuleList));
+			dwOffset = sizeof(UINT64)*2;
+			break;
+		case 2:
+			pUserModuleHead = pUserModule = (PLIST_ENTRY)(&(pLdrData->InInitializationOrderModuleList));
+			dwOffset = sizeof(UINT64)*4;
+			break;
 		}
 
-		f = dataEntry->InMemoryOrderLinks.Flink;
+		while (pUserModule->Flink != pUserModuleHead)
+		{
+			pUserModule = pUserModule->Flink;
+			lpModule = (PUNICODE_STRING)(((LONGLONG)(pUserModule)) + (72 - dwOffset));
+        
+			for (n = 0; n <(lpModule->Length) / 2 && n < 512; n++)
+				szModuleName[n] = (CHAR)(*((lpModule->Buffer) + (n)));
+
+			szModuleName[n] = '\0';
+			if (strstr(szModuleName, szModule))
+			{
+				if (!pLdrModule)
+					pLdrModule = (PLDR_MODULE)(((LONGLONG)(pUserModule)) - dwOffset);
+             
+				pUserModule->Blink->Flink = pUserModule->Flink;
+				pUserModule->Flink->Blink = pUserModule->Blink;
+				printf("Found...\n");
+			}
+		}
+	}
+
+	// Unlink from LdrpHashTable
+	if (pLdrModule)
+	{
+		pLdrModule->HashTableEntry.Blink->Flink = pLdrModule->HashTableEntry.Flink;
+		pLdrModule->HashTableEntry.Flink->Blink = pLdrModule->HashTableEntry.Blink;
 	}
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved) {
-	
-	// Get rid of compiler warnings since we do not use this parameter
-	UNREFERENCED_PARAMETER(lpReserved);
+void RemovePeHeader(HANDLE GetModuleBase)
+{
+	PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)GetModuleBase;
+	PIMAGE_NT_HEADERS pNTHeader = (PIMAGE_NT_HEADERS)((PBYTE)pDosHeader + (DWORD)pDosHeader->e_lfanew);
 
-	switch (ulReason) {
+	if (pNTHeader->Signature != IMAGE_NT_SIGNATURE)
+		return;
 
+	if (pNTHeader->FileHeader.SizeOfOptionalHeader)
+	{
+		DWORD Protect;
+		WORD Size = pNTHeader->FileHeader.SizeOfOptionalHeader;
+		VirtualProtect((void*)GetModuleBase, Size, PAGE_EXECUTE_READWRITE, &Protect);
+		RtlZeroMemory((void*)GetModuleBase, Size);
+		VirtualProtect((void*)GetModuleBase, Size, Protect, &Protect);
+	}
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReserved)
+{
+	switch (ul_reason_for_call)
+	{
 	case DLL_PROCESS_ATTACH:
+	{
+		AllocConsole();
+		freopen("CON", "w", stdout);
+		freopen("CON", "r", stdin);
 
-		CheckSumBaseCloak();
-		MessageBoxA(0, "DLL Locked and Loaded.", "DLL Injection Works!", 0);
-		break;
+		//RemovePeHeader causes crash on .NET assemblies - .NET does check on integrity of PE header/image
+		CHAR dllName[] = "YourDLL.dll";
+		ULONG len = (ULONG)strlen(dllName);
+		DisableThreadLibraryCalls(hDLLModule);
+		RemovePeHeader(GetModuleHandleA("YourDLL.dll"));
+		printf("PE Header removed..\n");
+		UnlinkModule(dllName);
+		printf("Module unlinked...\n");
+		ZeroMemory(dllName, len);
+		
+	}break;
+
 	case DLL_THREAD_ATTACH:
-		break;
 	case DLL_THREAD_DETACH:
-		break;
 	case DLL_PROCESS_DETACH:
 		break;
 	}
-
-	return (TRUE);
+	return TRUE;
 }
